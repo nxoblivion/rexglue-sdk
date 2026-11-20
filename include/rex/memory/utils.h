@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include <utility>
+#include <vector>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -113,6 +115,28 @@ bool Protect(void* base_address, size_t length, PageAccess access,
 // rights. The length will start from the first byte of the first page of
 // the region.
 bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out);
+
+#if REX_PLATFORM_SWITCH
+// Nintendo Switch: the app hands over a block of its process heap (reserved in __libnx_initheap) that
+// backs committed guest memory; SwitchInitGuestArena() then claims the guest windows inside the
+// stack region and returns the arena base (guest address g is at base + g). See memory_switch.cpp.
+void SwitchSetGuestPool(void* pool, size_t size);
+void* SwitchInitGuestArena();
+// Called from the fault handler: commits the segment backing `address` if it lies inside the
+// guest arena. Returns true if the faulting access can be retried.
+bool HandleGuestMemoryFault(uintptr_t address);
+// Arena base (guest address g is at base + g), or nullptr before SwitchInitGuestArena().
+void* SwitchArenaBase();
+// Lock-free: true if the 64 KiB unit holding guest address `g` is host-mapped (safe to touch).
+bool SwitchGuestMapped(uint32_t g);
+// Guest ranges (64 KiB aligned) that are already host-mapped by foreign mappings (libnx thread
+// stacks etc.) inside the guest windows. They can never be committed and must be treated as
+// reserved by the guest heaps. Appends {guest_address, size} pairs.
+void SwitchGetBlockedRanges(std::vector<std::pair<uint32_t, uint32_t>>* out);
+// Eagerly map every unit overlapping the host range (used before the host reads/writes guest memory
+// that the guest has only reserved). Logs the first few such "reserved but uncommitted" accesses.
+bool SwitchEnsureMapped(const void* host_addr, size_t length, const char* why);
+#endif
 
 // Allocates a block of memory for a type with the given alignment.
 // The memory must be freed with AlignedFree.

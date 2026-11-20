@@ -20,7 +20,9 @@
 #include <rex/graphics/pipeline/shader/spirv_builder.h>
 #include <rex/graphics/pipeline/shader/translator.h>
 #include <rex/graphics/xenos.h>
+#if !REX_PLATFORM_SWITCH
 #include <rex/ui/vulkan/device.h>
+#endif
 
 namespace rex::graphics {
 
@@ -223,6 +225,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
     uint32_t vertex_index_reset;
     // Number of guest vertices processed by the memexport compute dispatch.
     uint32_t compute_memexport_vertex_count;
+    // std140: the float4 array must be 16-byte aligned (SPIRV-Cross / GL reject the block otherwise).
+    uint32_t _pad_std140_clip_planes;
     float user_clip_planes[6][4];
 
     float ndc_scale[3];
@@ -238,6 +242,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // One bit per texture fetch constant indicating that it references a
     // draw-resolution-scaled texture.
     uint32_t textures_resolution_scaled;
+    uint32_t _pad_std140_swizzled_signs[3];
 
     // Each byte contains post-swizzle TextureSign values for each of the needed
     // components of each of the 32 used texture fetch constants.
@@ -374,7 +379,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
   static constexpr uint32_t kSpirvMagicToolId = 26;
 
   struct Features {
+#if !REX_PLATFORM_SWITCH
     explicit Features(const ui::vulkan::VulkanDevice* vulkan_device);
+#endif
     explicit Features(bool all = false);
 
     unsigned int spirv_version;
@@ -399,6 +406,28 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
     bool demote_to_helper_invocation;
     bool sample_rate_shading;
+
+    // Texture fetch results: swizzle (when !image_view_format_swizzle) and signedness (biased / gamma) applied
+    // branch-free, per fetch as one vector pass, instead of an if/else per component plus a switch per component.
+    // Same results. Used by the OpenGL backend: Mesa's GLSL compiler on the Switch needs minutes for the
+    // per-component form of shaders with ~20 texture fetches (200-300 KB of GLSL). Off for Vulkan.
+    bool compact_texture_result = false;
+
+    // Xenos "0 * anything = 0" multiplication rule as "NaN result -> 0" (one isnan() per product) instead of
+    // "min(|a|, |b|) == 0 -> 0". Identical unless an operand is already NaN (NaN * non-zero gives 0 instead of NaN).
+    // Used by the OpenGL backend to keep the GLSL small for Mesa. Off for Vulkan.
+    bool cheap_mul_zero_rule = false;
+
+    // Pixel shader fetches with derivative-based LOD (no register gradients, not 3D / stacked): sample with an
+    // implicit LOD and the LOD bias as the Bias operand instead of explicit gradients scaled by exp2(bias). Same mip
+    // selection (scaling the gradients by 2^b adds b to the LOD), but explicit-gradient sampling runs at a fraction
+    // of the texture rate on NVIDIA Maxwell (the Switch's Tegra X1). Off for Vulkan.
+    bool implicit_lod_bias = false;
+
+    // EXPERIMENT (upper bound of the texture fetch emulation cost): pixel shader fetches assume an unsigned texture,
+    // identity swizzle and no exponent bias - no signed sample, no swizzle / sign / gamma / exponent code. Wrong
+    // colours for textures that need any of those. Off for Vulkan.
+    bool fetch_assume_plain = false;
   };
 
   SpirvShaderTranslator(const Features& features, bool native_2x_msaa_with_attachments,
@@ -849,8 +878,6 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantVertexIndexReset,
     kSystemConstantComputeMemExportVertexCount,
     kSystemConstantUserClipPlanes,
-    kSystemConstantVertexIndexMin,
-    kSystemConstantVertexIndexMax,
     kSystemConstantNdcScale,
     kSystemConstantPointVertexDiameterMin,
     kSystemConstantNdcOffset,
@@ -879,6 +906,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantEdramRTKeepMask,
     kSystemConstantEdramRTClamp,
     kSystemConstantEdramBlendConstant,
+    // Last in the structure (offset order must match the member order for SPIRV-Cross layout checks).
+    kSystemConstantVertexIndexMin,
+    kSystemConstantVertexIndexMax,
   };
   spv::Id uniform_system_constants_;
   spv::Id uniform_float_constants_;

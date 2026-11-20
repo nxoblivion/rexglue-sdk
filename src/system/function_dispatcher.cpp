@@ -13,15 +13,33 @@
  *              role as a function dispatch table rather than a CPU emulator.
  */
 
+#include <cstring>
+#include <string>
+
+#include <fmt/format.h>
 #include <rex/assert.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
 #include <rex/memory.h>
+#include <rex/types.h>
 #include <rex/ppc/context.h>
 #include <rex/runtime.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/thread_state.h>
+#include <rex/system/xthread.h>
+
+#if REX_PLATFORM_SWITCH
+namespace rex {
+volatile int g_import_trace = 0;
+void TraceImport(const char* name, uint32_t lr, uint32_t r3_in, uint32_t r3_out) {
+  auto* th = rex::system::XThread::GetCurrentThread();
+  if (g_import_trace > 1 && (!th || th->thread_id() != uint32_t(g_import_trace - 1))) return;
+  if (std::strstr(name, "CriticalSection")) return;
+  REXLOG_INFO("[imp] {} lr={:08X} r3 {:08X} -> {:08X}", name, lr, r3_in, r3_out);
+}
+}  // namespace rex
+#endif
 
 namespace rex::runtime {
 
@@ -34,7 +52,38 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
 
 }  // namespace
 
-static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
+static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* base) {
+#if REX_PLATFORM_SWITCH
+  {
+    // Best-effort guest call stack (saved-LR chain) to make the trap actionable.
+    auto ld = [&](uint32_t a) { return rex::byte_swap(*reinterpret_cast<uint32_t*>(base + a)); };
+    std::string stack;
+    uint32_t sp = ctx.r1.u32;
+    for (int d = 0; d < 12 && sp >= 0x10000 && sp < 0x80000000; ++d) {
+      uint32_t back = ld(sp);
+      if (back <= sp || back >= 0x80000000) break;
+      stack += fmt::format(" {:08X}", ld(back - 8));
+      sp = back;
+    }
+    {
+      std::string regs;
+      const uint32_t rv[] = {ctx.r3.u32,ctx.r4.u32,ctx.r5.u32,ctx.r6.u32,ctx.r7.u32,ctx.r8.u32,ctx.r9.u32,ctx.r10.u32,ctx.r11.u32,ctx.r12.u32,ctx.r13.u32,ctx.r14.u32,ctx.r15.u32,ctx.r16.u32,ctx.r17.u32,ctx.r18.u32,ctx.r19.u32,ctx.r20.u32,ctx.r21.u32,ctx.r22.u32,ctx.r23.u32,ctx.r24.u32,ctx.r25.u32,ctx.r26.u32,ctx.r27.u32,ctx.r28.u32,ctx.r29.u32,ctx.r30.u32,ctx.r31.u32};
+      for (int i = 0; i < 29; ++i) regs += fmt::format(" r{}={:08X}", i + 3, rv[i]);
+      REXLOG_ERROR("InvalidFunctionTrap regs:{}", regs);
+      for (uint32_t a : {ctx.r31.u32, ctx.r30.u32}) {
+        if (a >= 0x10000 && a < 0xBFF00000u) {
+          std::string d;
+          for (int k = -4; k < 28; ++k) d += fmt::format(" {:08X}", ld(a + k * 4));
+          REXLOG_ERROR("  mem at {:08X}-16:{}", a, d);
+        }
+      }
+    }
+    REXLOG_ERROR("InvalidFunctionTrap: lr={:08X} r1={:08X} r3={:08X} call stack:{}",
+                 uint32_t(ctx.lr), ctx.r1.u32, ctx.r3.u32, stack);
+  }
+#else
+  (void)base;
+#endif
   REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}",
             ctx.last_indirect_target);
 }

@@ -1,0 +1,193 @@
+#include "spirv_to_glsl.h"
+
+#include <cstring>
+#include <exception>
+#include <memory>
+
+#include <spirv_glsl.hpp>
+
+#include <rex/cvar.h>
+#include <rex/logging.h>
+
+REXCVAR_DEFINE_BOOL(gl_native_min_max, true, "GPU",
+                    "GL backend: translate NaN-ignoring min/max/clamp (SPIR-V NMin/NMax/NClamp) to plain GLSL "
+                    "min/max/clamp (same results on Maxwell; avoids isnan() chains that made Mesa compiles very slow)");
+
+namespace rex::graphics::gl {
+
+namespace {
+void DumpBlocks(spirv_cross::CompilerGLSL& comp) {
+  auto res = comp.get_shader_resources();
+  auto dump = [&](const char* kind, spirv_cross::SmallVector<spirv_cross::Resource>& v) {
+    for (auto& r : v) {
+      const auto& t = comp.get_type(r.base_type_id);
+      REXGPU_ERROR("  {} '{}' members={} declared_size={}", kind, r.name, t.member_types.size(),
+                   comp.get_declared_struct_size(t));
+      for (uint32_t i = 0; i < t.member_types.size(); ++i) {
+        const auto& mt = comp.get_type(t.member_types[i]);
+        REXGPU_ERROR("    [{}] {} off={} basetype={} vec={} cols={} arr={} stride={}", i,
+                     comp.get_member_name(r.base_type_id, i), comp.type_struct_member_offset(t, i),
+                     uint32_t(mt.basetype), mt.vecsize, mt.columns, mt.array.size(),
+                     mt.array.empty() ? 0u : comp.type_struct_member_array_stride(t, i));
+      }
+    }
+  };
+  dump("UBO", res.uniform_buffers);
+  dump("SSBO", res.storage_buffers);
+}
+
+// Eden (and some drivers) cannot run vertex shaders that load from SSBOs; shared memory is therefore read
+// through R32UI texture buffers: xe_shared_memory[k].shared_memory[expr] -> texelFetch(xe_sm_tbo_k, int(expr)).x
+void RewriteSharedMemoryAsTbo(std::string& src) {
+  const std::string decl_marker = "xe_shared_memory[4];";
+  size_t dm = src.find(decl_marker);
+  if (dm == std::string::npos) {
+    return;
+  }
+  size_t ds = src.rfind("layout(", dm);
+  if (ds == std::string::npos) {
+    return;
+  }
+  std::string decls;
+  decls += "layout(binding = " + std::to_string(kSharedMemoryTboUnitBase) + ") uniform usamplerBuffer xe_sm_store;\n";
+  decls += "layout(binding = " + std::to_string(kSharedMemoryTboUnitBase + 1) + ") uniform usamplerBuffer xe_sm_pt;\n";
+  // a = dword index in the 512 MiB guest physical space; 1 MiB granules = 2^18 dwords.
+  decls += "uint xe_sm_fetch(uint a) {\n"
+           "  uint h = texelFetch(xe_sm_pt, int(a >> 18)).x;\n"
+           "  if (h == 0xFFFFFFFFu) return 0u;\n"
+           "  return texelFetch(xe_sm_store, int(h + (a & 0x3FFFFu))).x;\n"
+           "}\n";
+  src.replace(ds, dm + decl_marker.size() - ds, decls);
+  const std::string use = "xe_shared_memory[";
+  size_t pos = 0;
+  while ((pos = src.find(use, pos)) != std::string::npos) {
+    size_t k_begin = pos + use.size();
+    size_t k_end = src.find(']', k_begin);
+    const std::string member = "].shared_memory[";
+    if (k_end == std::string::npos || src.compare(k_end, member.size(), member) != 0) {
+      pos = k_begin;
+      continue;
+    }
+    std::string k = src.substr(k_begin, k_end - k_begin);
+    size_t e_begin = k_end + member.size();
+    size_t depth = 1, e = e_begin;
+    while (e < src.size() && depth) {
+      if (src[e] == '[') ++depth;
+      else if (src[e] == ']') --depth;
+      ++e;
+    }
+    std::string expr = src.substr(e_begin, e - 1 - e_begin);
+    std::string rep = "xe_sm_fetch(uint(" + k + ") * 33554432u + uint(" + expr + "))";
+    src.replace(pos, e - pos, rep);
+    pos += rep.size();
+  }
+}
+
+}  // namespace
+
+// GLSL has no NaN-ignoring min/max/clamp, so SPIRV-Cross expands GLSL.std.450 NMin / NMax / NClamp into isnan()
+// select chains (several lines per use; the translator uses them for every Xenos min/max, for the 0 * x = 0 rule of
+// every multiplication, saturation, gamma, ...). On the Switch GPU (Maxwell FMNMX, like PTX min/max) plain min/max
+// already return the non-NaN operand, so FMin / FMax / FClamp give the same results with much less GLSL for Mesa
+// to compile. Rewrites the extended instruction numbers in place.
+void UseNativeMinMax(std::vector<uint32_t>& words) {
+  if (words.size() < 5) return;
+  uint32_t glsl_set = 0;
+  for (size_t i = 5; i < words.size();) {
+    const uint32_t count = words[i] >> 16, op = words[i] & 0xFFFF;
+    if (!count || i + count > words.size()) break;
+    if (op == 11 /* OpExtInstImport */ && count >= 3 &&
+        !std::strncmp(reinterpret_cast<const char*>(&words[i + 2]), "GLSL.std.450", (count - 2) * 4)) {
+      glsl_set = words[i + 1];
+    } else if (op == 12 /* OpExtInst */ && count >= 5 && glsl_set && words[i + 3] == glsl_set) {
+      uint32_t& inst = words[i + 4];
+      if (inst == 79) inst = 37;       // NMin -> FMin
+      else if (inst == 80) inst = 40;  // NMax -> FMax
+      else if (inst == 81) inst = 43;  // NClamp -> FClamp
+    }
+    i += count;
+  }
+}
+
+bool ConvertSpirvToGlsl(const std::vector<uint8_t>& spirv, uint32_t texture_unit_base,
+                        uint32_t texture_count, GlslShader& out, std::string& error) {
+  std::unique_ptr<spirv_cross::CompilerGLSL> comp_ptr;
+  try {
+    std::vector<uint32_t> words(spirv.size() / 4);
+    std::memcpy(words.data(), spirv.data(), words.size() * 4);
+    if (REXCVAR_GET(gl_native_min_max)) UseNativeMinMax(words);
+    comp_ptr = std::make_unique<spirv_cross::CompilerGLSL>(std::move(words));
+    spirv_cross::CompilerGLSL& comp = *comp_ptr;
+    spirv_cross::CompilerGLSL::Options o;
+    o.version = 430;
+    o.es = false;
+    o.vulkan_semantics = false;
+    o.separate_shader_objects = true;
+    o.enable_420pack_extension = false;
+    o.emit_push_constant_as_uniform_buffer = true;
+    comp.set_common_options(o);
+    auto res = comp.get_shader_resources();
+    auto remap = [&](spirv_cross::SmallVector<spirv_cross::Resource>& v) {
+      for (auto& r : v) {
+        uint32_t set = comp.get_decoration(r.id, spv::DecorationDescriptorSet);
+        uint32_t bind = comp.get_decoration(r.id, spv::DecorationBinding);
+        comp.unset_decoration(r.id, spv::DecorationDescriptorSet);
+        comp.set_decoration(r.id, spv::DecorationBinding, set * 8 + bind);
+      }
+    };
+    out.samplers.clear();
+    if (!res.separate_images.empty()) {
+      comp.build_dummy_sampler_for_combined_images();
+      comp.build_combined_image_samplers();
+      uint32_t index = 0;
+      for (auto& c : comp.get_combined_image_samplers()) {
+        CombinedSampler cs;
+        cs.unit = texture_unit_base + index++;
+        cs.texture_binding = int32_t(comp.get_decoration(c.image_id, spv::DecorationBinding));
+        if (comp.has_decoration(c.sampler_id, spv::DecorationBinding)) {
+          uint32_t sampler_binding = comp.get_decoration(c.sampler_id, spv::DecorationBinding);
+          cs.sampler_binding = int32_t(sampler_binding) - int32_t(texture_count);
+        } else {
+          cs.sampler_binding = -1;
+        }
+        out.samplers.push_back(cs);
+        comp.set_decoration(c.combined_id, spv::DecorationBinding, cs.unit);
+        comp.unset_decoration(c.combined_id, spv::DecorationDescriptorSet);
+      }
+      res.separate_images.clear();
+      res.separate_samplers.clear();
+    }
+    for (auto& pc : res.push_constant_buffers) {
+      comp.set_decoration(pc.id, spv::DecorationBinding, kUboBindingPushConstants);
+    }
+    remap(res.uniform_buffers);
+    remap(res.storage_buffers);
+    remap(res.sampled_images);
+    remap(res.storage_images);
+    out.source = comp.compile();
+    RewriteSharedMemoryAsTbo(out.source);
+    // The vertex and pixel stage float-constant blocks have different array sizes; GL requires
+    // identically defined blocks of the same name across the linked stages.
+    if (comp.get_execution_model() == spv::ExecutionModelFragment) {
+      const std::string blk = "uniform XeFloatConstants";
+      size_t bp = out.source.find(blk);
+      if (bp != std::string::npos) {
+        out.source.replace(bp, blk.size(), "uniform XeFloatConstantsPS");
+      }
+    }
+    if (out.source.find("gl_CullDistance") != std::string::npos) {
+      size_t nl = out.source.find('\n');
+      out.source.insert(nl + 1, "#extension GL_ARB_cull_distance : require\n");
+    }
+    return true;
+  } catch (const std::exception& e) {
+    error = e.what();
+    static int dumps = 0;
+    if (comp_ptr && dumps++ < 2) {
+      DumpBlocks(*comp_ptr);
+    }
+    return false;
+  }
+}
+
+}  // namespace rex::graphics::gl

@@ -28,6 +28,13 @@ spv::Id SpirvShaderTranslator::ZeroIfAnyOperandIsZero(spv::Id value, spv::Id ope
   int num_components = builder_->getNumComponents(value);
   assert_true(builder_->getNumComponents(operand_0_abs) == num_components);
   assert_true(builder_->getNumComponents(operand_1_abs) == num_components);
+  if (features_.cheap_mul_zero_rule) {
+    // 0 * inf / inf * 0 are the only finite-operand products that give NaN.
+    return builder_->createTriOp(
+        spv::OpSelect, type_float_vectors_[num_components - 1],
+        builder_->createUnaryOp(spv::OpIsNan, type_bool_vectors_[num_components - 1], value),
+        const_float_vectors_0_[num_components - 1], value);
+  }
   return builder_->createTriOp(
       spv::OpSelect, type_float_,
       builder_->createBinOp(spv::OpFOrdEqual, type_bool_vectors_[num_components - 1],
@@ -229,15 +236,22 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
         }
         // Check if the different components in any of the operands are zero,
         // even if the other is NaN - if min(|a|, |b|) is 0.
-        for (uint32_t i = 0; i < 2; ++i) {
-          different_operands[i] =
-              GetAbsoluteOperand(different_operands[i], instr.vector_operands[i]);
+        spv::Id different_zero;
+        if (features_.cheap_mul_zero_rule) {
+          // See Features::cheap_mul_zero_rule: a NaN product becomes 0.
+          different_zero = builder_->createUnaryOp(
+              spv::OpIsNan, type_bool_vectors_[different_count - 1], different_result);
+        } else {
+          for (uint32_t i = 0; i < 2; ++i) {
+            different_operands[i] =
+                GetAbsoluteOperand(different_operands[i], instr.vector_operands[i]);
+          }
+          different_zero = builder_->createBinOp(
+              spv::OpFOrdEqual, type_bool_vectors_[different_count - 1],
+              builder_->createBinBuiltinCall(different_type, ext_inst_glsl_std_450_, GLSLstd450NMin,
+                                             different_operands[0], different_operands[1]),
+              const_float_vectors_0_[different_count - 1]);
         }
-        spv::Id different_zero = builder_->createBinOp(
-            spv::OpFOrdEqual, type_bool_vectors_[different_count - 1],
-            builder_->createBinBuiltinCall(different_type, ext_inst_glsl_std_450_, GLSLstd450NMin,
-                                           different_operands[0], different_operands[1]),
-            const_float_vectors_0_[different_count - 1]);
         // Replace with +0.
         different_result =
             builder_->createTriOp(spv::OpSelect, different_type, different_zero,

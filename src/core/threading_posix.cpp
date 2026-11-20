@@ -7,12 +7,16 @@
  */
 
 #include <rex/platform.h>
+#if REX_PLATFORM_SWITCH
+#include <switch.h>
+#endif
 #include <rex/thread.h>
 
-static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
+static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_SWITCH, "This file is POSIX-only");
 
 #include <signal.h>
 
+#include <algorithm>
 #include <atomic>
 #include <array>
 #include <cerrno>
@@ -30,7 +34,9 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 
 #include <fcntl.h>
 #endif
+#if !REX_PLATFORM_SWITCH
 #include <sys/syscall.h>
+#endif
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -62,6 +68,13 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #define REX_HAS_SIGEV_THREAD_ID 0
 #endif
 
+#if REX_PLATFORM_SWITCH
+extern "C" void oblivion_bootlog(const char* fmt, ...) __attribute__((weak, format(printf, 1, 2)));
+// Host sampling profiler (app side, optional): Horizon handles of the threads created here, with their names.
+extern "C" void oblivion_thread_started(uint32_t handle) __attribute__((weak));
+extern "C" void oblivion_thread_named(uint32_t handle, const char* name) __attribute__((weak));
+extern "C" void oblivion_thread_exiting(uint32_t handle) __attribute__((weak));
+#endif
 namespace rex::thread {
 
 #if REX_PLATFORM_ANDROID
@@ -115,7 +128,7 @@ enum class SignalType {
 };
 
 int GetSystemSignal(SignalType num) {
-#if defined(__APPLE__)
+#if defined(__APPLE__) || REX_PLATFORM_SWITCH
   // macOS has no realtime signals (SIGRTMIN..SIGRTMAX); map the runtime's
   // signals onto the two user-defined signals.
   switch (num) {
@@ -135,7 +148,7 @@ int GetSystemSignal(SignalType num) {
 }
 
 SignalType GetSystemSignalType(int num) {
-#if defined(__APPLE__)
+#if defined(__APPLE__) || REX_PLATFORM_SWITCH
   switch (num) {
     case SIGUSR1:
       return SignalType::kThreadSuspend;
@@ -156,6 +169,12 @@ std::array<std::atomic<bool>, static_cast<size_t>(SignalType::k_Count)> signal_h
 static void signal_handler(int signal, siginfo_t* info, void* context);
 
 void install_signal_handler(SignalType type) {
+#if REX_PLATFORM_SWITCH
+  // STUB (Switch): newlib/libnx has no sigaction(SA_SIGINFO); thread suspend and
+  // queued user callbacks cannot be delivered asynchronously yet.
+  (void)type;
+  return;
+#else
   bool expected = false;
   if (!signal_handler_installed[static_cast<size_t>(type)].compare_exchange_strong(expected,
                                                                                    true)) {
@@ -168,6 +187,7 @@ void install_signal_handler(SignalType type) {
   if (sigaction(GetSystemSignal(type), &action, nullptr) != 0) {
     signal_handler_installed[static_cast<size_t>(type)] = false;
   }
+#endif  // REX_PLATFORM_SWITCH
 }
 
 // TODO(dougvj)
@@ -178,6 +198,9 @@ void EnableAffinityConfiguration() {}
 uint32_t current_thread_system_id() {
 #if defined(__APPLE__)
   return static_cast<uint32_t>(pthread_mach_thread_np(pthread_self()));
+#elif REX_PLATFORM_SWITCH
+  // newlib pthread_t is a small integer id
+  return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pthread_self()));
 #else
   return static_cast<uint32_t>(syscall(SYS_gettid));
 #endif
@@ -335,7 +358,35 @@ class PosixConditionBase {
                         ? std::chrono::steady_clock::time_point::max()
                         : start_time + timeout;
 
+    // Every handle wakes this waiter when it becomes signaled (NotifyLocked), so the loop below blocks until a
+    // signal or the deadline instead of polling (the 1 ms poll truncated to sleep_for(0) under 1 ms remaining, a
+    // busy spin; the audio worker burned a whole core in it on the Switch).
+    MultiWaiter waiter;
+    struct Registration {
+      std::vector<PosixConditionBase*>& handles;
+      MultiWaiter* waiter;
+      explicit Registration(std::vector<PosixConditionBase*>& h, MultiWaiter* w) : handles(h), waiter(w) {
+        for (PosixConditionBase* c : handles) {
+          std::lock_guard<std::mutex> lock(c->mutex_);
+          c->multi_waiters_.push_back(waiter);
+        }
+      }
+      ~Registration() {
+        for (PosixConditionBase* c : handles) {
+          std::lock_guard<std::mutex> lock(c->mutex_);
+          auto& v = c->multi_waiters_;
+          auto it = std::find(v.begin(), v.end(), waiter);
+          if (it != v.end()) v.erase(it);
+        }
+      }
+    } registration(handles, &waiter);
+
     while (true) {
+      {
+        // Reset before checking: a signal between the check and the wait below sets it again.
+        std::lock_guard<std::mutex> lock(waiter.mutex);
+        waiter.woken = false;
+      }
       size_t first_signaled = std::numeric_limits<size_t>::max();
       bool condition_met = false;
       bool all_locked = true;
@@ -411,13 +462,10 @@ class PosixConditionBase {
         return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
       }
 
-      if (timeout == std::chrono::milliseconds::max()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      } else {
-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
-        auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
-        std::this_thread::sleep_for(sleep_time);
-      }
+      // The 100 ms cap only bounds the damage of a signal path that does not notify.
+      std::unique_lock<std::mutex> lock(waiter.mutex);
+      waiter.cv.wait_until(lock, std::min(end_time, now + std::chrono::milliseconds(100)),
+                           [&waiter] { return waiter.woken; });
     }
   }
 
@@ -426,10 +474,25 @@ class PosixConditionBase {
   }
 
  protected:
+  struct MultiWaiter {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool woken = false;
+  };
   inline virtual bool signaled() const = 0;
   inline virtual void post_execution() = 0;
+  // Wakes single waiters (cond_) and WaitMultiple waiters registered on this handle. Caller holds mutex_.
+  void NotifyLocked() {
+    cond_.notify_all();
+    for (MultiWaiter* w : multi_waiters_) {
+      std::lock_guard<std::mutex> lock(w->mutex);
+      w->woken = true;
+      w->cv.notify_one();
+    }
+  }
   std::condition_variable cond_;
   std::mutex mutex_;
+  std::vector<MultiWaiter*> multi_waiters_;  // guarded by mutex_
 };
 
 // There really is no native POSIX handle for a single wait/signal construct
@@ -449,7 +512,7 @@ class PosixCondition<Event> : public PosixConditionBase {
   bool Signal() override {
     auto lock = std::unique_lock<std::mutex>(mutex_);
     signal_ = true;
-    cond_.notify_all();
+    NotifyLocked();
     return true;
   }
 
@@ -486,7 +549,7 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
       *out_previous_count = count_;
     }
     count_ += release_count;
-    cond_.notify_all();
+    NotifyLocked();
     return true;
   }
 
@@ -518,7 +581,7 @@ class PosixCondition<Mutant> : public PosixConditionBase {
       --count_;
       // Free to be acquired by another thread
       if (count_ == 0) {
-        cond_.notify_all();
+        NotifyLocked();
       }
       return true;
     }
@@ -550,7 +613,7 @@ class PosixCondition<Timer> : public PosixConditionBase {
   bool Signal() override {
     std::lock_guard<std::mutex> lock(mutex_);
     signal_ = true;
-    cond_.notify_all();
+    NotifyLocked();
     return true;
   }
 
@@ -655,6 +718,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
       pthread_attr_destroy(&attr);
       return false;
     }
+#if !REX_PLATFORM_SWITCH  // STUB (Switch): no SCHED_FIFO; map to svcSetThreadPriority later
     if (params.initial_priority != 0) {
       sched_param sched{};
       sched.sched_priority = params.initial_priority + 1;
@@ -667,6 +731,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
         return false;
       }
     }
+#endif
     if (pthread_create(&thread_, &attr, ThreadStartRoutine, start_data) != 0) {
       pthread_attr_destroy(&attr);
       return false;
@@ -742,6 +807,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
 #if REX_PLATFORM_ANDROID
       SetAndroidPreApi26Name(name);
 #endif
+#if REX_PLATFORM_SWITCH
+      if (nx_handle_ && oblivion_thread_named) oblivion_thread_named(nx_handle_, name.c_str());
+#endif
     }
   }
 
@@ -759,12 +827,18 @@ class PosixCondition<Thread> : public PosixConditionBase {
 #if defined(__APPLE__)
   uint32_t system_id() const { return static_cast<uint32_t>(pthread_mach_thread_np(thread_)); }
 #else
-  uint32_t system_id() const { return static_cast<uint32_t>(thread_); }
+  uint32_t system_id() const {
+#if REX_PLATFORM_SWITCH
+    return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(thread_));
+#else
+    return static_cast<uint32_t>(thread_);
+#endif
+  }
 #endif
 
   uint64_t affinity_mask() {
     WaitStarted();
-#if defined(__APPLE__)
+#if defined(__APPLE__) || REX_PLATFORM_SWITCH
     // macOS doesn't expose Linux-style pthread affinity masks; report every
     // logical processor as available.
     auto cpu_count = std::min<uint32_t>(logical_processor_count(), 64);
@@ -795,7 +869,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
 
   void set_affinity_mask(uint64_t mask) {
     WaitStarted();
-#if defined(__APPLE__)
+#if defined(__APPLE__) || REX_PLATFORM_SWITCH
     // macOS doesn't expose Linux-style pthread affinity masks; keep this a
     // no-op so higher layers can build and run.
     (void)mask;
@@ -821,6 +895,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
 
   int priority() {
     WaitStarted();
+#if REX_PLATFORM_SWITCH
+    return 0;  // STUB (Switch): svcGetThreadPriority
+#else
     int policy;
     sched_param param{};
     int ret = pthread_getschedparam(thread_, &policy, &param);
@@ -829,10 +906,15 @@ class PosixCondition<Thread> : public PosixConditionBase {
     }
 
     return param.sched_priority;
+#endif
   }
 
   void set_priority(int new_priority) {
     WaitStarted();
+#if REX_PLATFORM_SWITCH
+    (void)new_priority;  // STUB (Switch): svcSetThreadPriority
+    return;
+#else
     sched_param param{};
     param.sched_priority = new_priority;
     int result = pthread_setschedparam(thread_, SCHED_FIFO, &param);
@@ -849,6 +931,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
           break;
       }
     }
+#endif
   }
 
   void QueueUserCallback(std::function<void()> callback) {
@@ -868,7 +951,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
       return;
     }
 
-#if defined(__APPLE__)
+#if REX_PLATFORM_SWITCH
+    // STUB (Switch): no signals; callbacks only run when the target drains them in an
+    // alertable wait.
+    int result = 0;
+#elif defined(__APPLE__)
     // macOS has no sigqueue/pthread_sigqueue; pthread_kill delivers the signal
     // without the sigval payload.
     int result = pthread_kill(thread_, GetSystemSignal(SignalType::kThreadUserCallback));
@@ -978,7 +1065,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
 
       exit_code_ = exit_code;
       signaled_ = true;
-      cond_.notify_all();
+      NotifyLocked();
     }
     if (is_current_thread) {
       pthread_exit(reinterpret_cast<void*>(exit_code));
@@ -1027,6 +1114,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
 #endif
   }
   pthread_t thread_;
+#if REX_PLATFORM_SWITCH
+  uint32_t nx_handle_ = 0;  // Horizon thread handle (set by the thread itself at start)
+#endif
   bool signaled_;
   int exit_code_;
   State state_;             // Protected by state_mutex_
@@ -1399,6 +1489,21 @@ class PosixThread : public PosixConditionHandle<Thread> {
 thread_local PosixThread* current_thread_ = nullptr;
 
 void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+#if REX_PLATFORM_SWITCH
+  // libnx pthreads are created with core -2 = pinned to the process' single default core; at one equal
+  // priority Horizon never preempts, so guest threads that poll/yield starve each other (loading hangs).
+  // Allow all three application cores (0..2) and let the kernel balance.
+  {
+    static std::atomic<int> logged{0};
+    Result cmrc = svcSetThreadCoreMask(CUR_THREAD_HANDLE, -1, 0x7);
+    if ((R_FAILED(cmrc) || logged.load() < 3) && logged.fetch_add(1) < 6) {
+      s32 pref = 0;
+      u64 sm = 0;
+      svcGetThreadCoreMask(&pref, &sm, CUR_THREAD_HANDLE);
+      if (oblivion_bootlog) oblivion_bootlog("thread: svcSetThreadCoreMask(-1,7) rc=0x%x; now pref=%d affinity=0x%llx", (unsigned)cmrc, (int)pref, (unsigned long long)sm);
+    }
+  }
+#endif
 #if !REX_PLATFORM_ANDROID
   if (pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, nullptr) != 0) {
     assert_always();
@@ -1417,6 +1522,10 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
 
   current_thread_ = thread;
   current_thread_condition_ = &thread->handle_;
+#if REX_PLATFORM_SWITCH
+  thread->handle_.nx_handle_ = threadGetCurHandle();
+  if (oblivion_thread_started) oblivion_thread_started(thread->handle_.nx_handle_);
+#endif
   {
     std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
     thread->handle_.state_ = create_suspended ? State::kSuspended : State::kRunning;
@@ -1439,6 +1548,9 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
 
   start_routine();
 
+#if REX_PLATFORM_SWITCH
+  if (oblivion_thread_exiting) oblivion_thread_exiting(thread->handle_.nx_handle_);
+#endif
   {
     std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
     thread->handle_.state_ = State::kFinished;
@@ -1448,7 +1560,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
     std::unique_lock<std::mutex> lock(thread->handle_.mutex_);
     thread->handle_.exit_code_ = 0;
     thread->handle_.signaled_ = true;
-    thread->handle_.cond_.notify_all();
+    thread->handle_.NotifyLocked();
   }
 
   current_thread_ = nullptr;
